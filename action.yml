@@ -1,0 +1,145 @@
+name: Build and Push Docker Image
+description: Build and push Docker images with optional tagging.
+
+inputs:
+  owner:
+    description: 'The owner of the repository (defaults to the GitHub repository owner).'
+    required: false
+    default: '${{ github.repository_owner }}'
+  repository_name:
+    description: 'The name of the repository (defaults to the GitHub repository name).'
+    required: false
+    default: '${{ github.event.repository.name }}'
+  registry:
+    description: 'The Docker registry to use (defaults to GitHub Container Registry).'
+    required: false
+    default: 'ghcr.io'
+  docker_username:
+    description: 'Username for Docker registry (defaults to GitHub username).'
+    required: false
+    default: '${{ github.actor }}'
+  docker_token:
+    description: 'Access token for Docker registry login (required).'
+    required: true
+    secret: true
+  with_latest_tag:
+    description: 'Whether to push the latest image (default is true).'
+    required: false
+    default: 'true'
+  with_release_tag:
+    description: 'Whether to retag and push the image with the release version if triggered on a release (default is false).'
+    required: false
+    default: 'false'
+  tags:
+    description: 'Array of additional tags to push (optional).'
+    required: false
+    type: array
+  trigger_event:
+    description: 'Whether to trigger an event after pushing images (default is false).'
+    required: false
+    default: 'false'
+    type: boolean
+  event_name:
+    description: 'Event name for the workflow (default is docker-images-pushed).'
+    required: false
+    default: 'docker-images-pushed'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Sanitize inputs
+      run: |
+        # Function to sanitize input by converting to lower case and replacing invalid characters
+        sanitize_input() {
+          echo "$1" | tr '[:upper:]' '[:lower:]' | tr -c '_[:alnum:]' '_' | sed 's/_\+/_/g' | sed 's/^_//;s/_$//'
+        }
+
+        # Sanitize only relevant inputs
+        REPOSITORY=$(sanitize_input "${{ inputs.repository_name }}")
+        OWNER=$(sanitize_input "${{ inputs.owner }}")
+        REGISTRY=$(sanitize_input "${{ inputs.registry }}")
+        DOCKER_USERNAME=$(sanitize_input "${{ inputs.docker_username }}")
+        DOCKER_TOKEN="${{ secrets.DOCKER_TOKEN }}"
+        
+        # Directly read boolean inputs
+        PUSH_LATEST="${{ inputs.with_latest_tag }}"
+        PUSH_RELEASE="${{ inputs.with_release_tag }}"
+
+        # Sanitize release version if applicable
+        RELEASE_VERSION=$(sanitize_input "${{ github.event.release.tag_name || github.ref_name }}")
+
+        # Sanitize tags if provided
+        TAGS=()
+        if [ -n "${{ inputs.tags }}" ]; then
+          IFS=',' read -ra TAG_ARRAY <<< "${{ inputs.tags }}"
+          for TAG in "${TAG_ARRAY[@]}"; do
+            TAGS+=("$(sanitize_input "$TAG")")
+          done
+        fi
+        
+        # Add 'latest' and release version to TAGS if applicable
+        if [ "$PUSH_LATEST" == "true" ]; then
+          TAGS+=("latest")
+        fi
+        if [ "$PUSH_RELEASE" == "true" ] && [ -n "$RELEASE_VERSION" ]; then
+          TAGS+=("$RELEASE_VERSION")
+        fi
+        
+        echo "REPOSITORY=${REPOSITORY}" >> $GITHUB_ENV
+        echo "OWNER=${OWNER}" >> $GITHUB_ENV
+        echo "REGISTRY=${REGISTRY}" >> $GITHUB_ENV
+        echo "DOCKER_USERNAME=${DOCKER_USERNAME}" >> $GITHUB_ENV
+        echo "DOCKER_TOKEN=${DOCKER_TOKEN}" >> $GITHUB_ENV
+        echo "RELEASE_VERSION=${RELEASE_VERSION}" >> $GITHUB_ENV
+        echo "PUSH_LATEST=${PUSH_LATEST}" >> $GITHUB_ENV
+        echo "PUSH_RELEASE=${PUSH_RELEASE}" >> $GITHUB_ENV
+        
+        # Create PUSHED_IMAGES variable
+        PUSHED_IMAGES=""
+        for TAG in "${TAGS[@]}"; do
+          PUSHED_IMAGES+="${TAG}:${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPOSITORY }}:${TAG},"
+        done
+        # Remove trailing comma
+        PUSHED_IMAGES=${PUSHED_IMAGES%,}
+        
+        echo "PUSHED_IMAGES=${PUSHED_IMAGES}" >> $GITHUB_ENV
+        echo "TRIGGER_EVENT=${{ inputs.trigger_event }}" >> $GITHUB_ENV
+        echo "EVENT_NAME=${{ inputs.event_name }}" >> $GITHUB_ENV
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ env.DOCKER_USERNAME }}
+        password: ${{ env.DOCKER_TOKEN }}
+
+    - name: Build and Push images
+      run: |
+        # Build the Docker image with a build tag
+        docker build -t ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPOSITORY }}:build .
+        
+        # Push all tags in PUSHED_IMAGES to the registry
+        IFS=',' read -ra IMAGE_ARRAY <<< "${{ env.PUSHED_IMAGES }}"
+        for TAG in "${IMAGE_ARRAY[@]}"; do
+          # Tag and push the image
+          IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPOSITORY }}:${TAG}"
+          docker tag ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPOSITORY }}:build "${IMAGE}"
+          docker push "${IMAGE}"
+        done
+
+    - name: Trigger Deploy Workflow
+      if: ${{ inputs.trigger_event }}
+      uses: peter-evans/repository-dispatch@v3
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        event-type: ${{ env.TRIGGER_EVENT }}
+        client-payload: |
+          {
+            ${{ toJson(fromJson(env.PUSHED_IMAGES), false) }}
+          }
